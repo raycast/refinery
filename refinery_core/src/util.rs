@@ -3,11 +3,117 @@ use crate::runner::Type;
 use crate::Migration;
 use regex::Regex;
 use std::ffi::OsStr;
+use std::iter::Peekable;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use walkdir::{DirEntry, WalkDir};
 
 const STEM_RE: &str = r"^([U|V])(\d+(?:\.\d+)?)__(\w+)";
+
+/// Select how to normalize line endings in embedded migrations:
+/// - `AsCRLF` normalizes all line endings to CRLF
+/// - `AsLF` normalizes all line endings to LF
+pub enum LineEndingNormalization {
+    AsCRLF,
+    AsLF,
+}
+
+pub trait SqlStringExt {
+    fn normalize_line_endings(self, normalization: LineEndingNormalization) -> Self;
+}
+
+impl SqlStringExt for String {
+    fn normalize_line_endings(self, normalization: LineEndingNormalization) -> Self {
+        match normalization {
+            LineEndingNormalization::AsCRLF => normalize_crlf(self),
+            LineEndingNormalization::AsLF => normalize_lf(self),
+        }
+    }
+}
+
+struct CRLFNormalized<I>
+where
+    I: Iterator<Item = char>,
+{
+    prev_was_cr: bool,
+    iter: Peekable<I>,
+}
+
+impl<I> Iterator for CRLFNormalized<I>
+where
+    I: Iterator<Item = char>,
+{
+    type Item = char;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.iter.peek() {
+            Some('\n') if !self.prev_was_cr => {
+                self.prev_was_cr = true;
+                Some('\r')
+            }
+            Some('\r') => {
+                self.prev_was_cr = true;
+                self.iter.next()
+            }
+            _other => {
+                self.prev_was_cr = false;
+                self.iter.next()
+            }
+        }
+    }
+}
+
+struct LFNormalized<I>
+where
+    I: Iterator<Item = char>,
+{
+    prev_was_cr: bool,
+    iter: I,
+}
+
+impl<I> Iterator for LFNormalized<I>
+where
+    I: Iterator<Item = char>,
+{
+    type Item = char;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.iter.next() {
+            Some('\n') if self.prev_was_cr => {
+                self.prev_was_cr = false;
+                match self.iter.next() {
+                    Some('\r') => {
+                        self.prev_was_cr = true;
+                        Some('\n')
+                    }
+                    other => other,
+                }
+            }
+            Some('\r') => {
+                self.prev_was_cr = true;
+                Some('\n')
+            }
+            other => {
+                self.prev_was_cr = false;
+                other
+            }
+        }
+    }
+}
+
+fn normalize_crlf(input: String) -> String {
+    String::from_iter(CRLFNormalized {
+        prev_was_cr: false,
+        iter: input.chars().peekable(),
+    })
+}
+
+fn normalize_lf(input: String) -> String {
+    String::from_iter(LFNormalized {
+        prev_was_cr: false,
+        iter: input.chars(),
+    })
+}
 
 /// Matches the stem of a migration file.
 fn file_stem_re() -> &'static Regex {
@@ -236,5 +342,45 @@ mod tests {
         assert_eq!(migrations.len(), 2);
         assert_eq!(&migrations[0].to_string(), "V1__first");
         assert_eq!(&migrations[1].to_string(), "V2__second");
+    }
+
+    #[test]
+    fn normalize_crlf() {
+        use super::SqlStringExt;
+        let sql1 = "CREATE TABLE foo (\nid INTEGER NOT NULL\n);";
+        let expected = "CREATE TABLE foo (\r\nid INTEGER NOT NULL\r\n);";
+
+        assert_eq!(
+            expected,
+            sql1.to_string()
+                .normalize_line_endings(super::LineEndingNormalization::AsCRLF)
+        );
+
+        assert_eq!(
+            expected,
+            expected
+                .to_string()
+                .normalize_line_endings(super::LineEndingNormalization::AsCRLF)
+        );
+    }
+
+    #[test]
+    fn normalize_lf() {
+        use super::SqlStringExt;
+        let sql1 = "CREATE TABLE foo (\r\nid INTEGER NOT NULL\r\n);";
+        let expected = "CREATE TABLE foo (\nid INTEGER NOT NULL\n);";
+
+        assert_eq!(
+            expected,
+            sql1.to_string()
+                .normalize_line_endings(super::LineEndingNormalization::AsLF)
+        );
+
+        assert_eq!(
+            expected,
+            expected
+                .to_string()
+                .normalize_line_endings(super::LineEndingNormalization::AsLF)
+        );
     }
 }
