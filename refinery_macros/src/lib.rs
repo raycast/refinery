@@ -10,7 +10,12 @@ use quote::ToTokens;
 use refinery_core::{find_migration_files, MigrationType};
 use std::path::PathBuf;
 use std::{env, fs};
-use syn::{parse_macro_input, Ident, LitStr};
+use syn::parse::Parser;
+use syn::punctuated::Punctuated;
+use syn::spanned::Spanned;
+use syn::Expr;
+use syn::Token;
+use syn::{Ident, LitStr};
 
 pub(crate) fn crate_root() -> PathBuf {
     let crate_root = env::var("CARGO_MANIFEST_DIR")
@@ -20,7 +25,7 @@ pub(crate) fn crate_root() -> PathBuf {
 
 fn migration_fn_quoted<T: ToTokens>(_migrations: Vec<T>) -> TokenStream2 {
     let result = quote! {
-        use refinery::{Migration, Runner, SchemaVersion};
+        use refinery::{Migration, Runner, SchemaVersion, SqlStringExt};
         pub fn runner() -> Runner {
             let quoted_migrations: Vec<(&str, String)> = vec![#(#_migrations),*];
             let mut migrations: Vec<Migration> = Vec::new();
@@ -96,11 +101,38 @@ fn migration_enum_quoted(migration_names: &[impl AsRef<str>]) -> TokenStream2 {
 /// [`Runner`]: https://docs.rs/refinery/latest/refinery/struct.Runner.html
 #[proc_macro]
 pub fn embed_migrations(input: TokenStream) -> TokenStream {
-    let location = if input.is_empty() {
-        crate_root().join("migrations")
+    let (location, normalization) = if input.is_empty() {
+        (crate_root().join("migrations"), None)
     } else {
-        let location: LitStr = parse_macro_input!(input);
-        crate_root().join(location.value())
+        if let Ok(location) = syn::parse::<LitStr>(input.clone()) {
+            (crate_root().join(location.value()), None)
+        } else {
+            let parser = Punctuated::<Expr, Token![,]>::parse_separated_nonempty;
+            match parser.parse(input.clone()) {
+                Ok(ref params) => {
+                    let p1 = params[0].clone();
+                    let p2 = params[1].clone();
+                    match (p1, p2) {
+                        (
+                            Expr::Lit(syn::ExprLit {
+                                lit: syn::Lit::Str(location),
+                                ..
+                            }),
+                            Expr::Path(syn::ExprPath { path, .. }),
+                        ) => (crate_root().join(location.value()), Some(path.clone())),
+                        _ => {
+                            return syn::Error::new(
+                                params.span(),
+                                "expected a string and a normalization type",
+                            )
+                            .into_compile_error()
+                            .into()
+                        }
+                    }
+                }
+                Err(err) => return err.into_compile_error().into(),
+            }
+        }
     };
 
     let migration_files =
@@ -121,7 +153,11 @@ pub fn embed_migrations(input: TokenStream) -> TokenStream {
         migration_filenames.push(filename.clone());
 
         if extension == "sql" {
-            _migrations.push(quote! {(#filename, include_str!(#path).to_string())});
+            if let Some(norm) = &normalization {
+                _migrations.push(quote! {(#filename, include_str!(#path).to_string().normalize_line_endings(#norm))});
+            } else {
+                _migrations.push(quote! {(#filename, include_str!(#path).to_string())});
+            }
         } else if extension == "rs" {
             let rs_content = fs::read_to_string(&path)
                 .unwrap()
@@ -206,7 +242,7 @@ mod tests {
     fn test_quote_fn() {
         let migs = vec![quote!("V1__first", "valid_sql_file")];
         let expected = concat! {
-            "use refinery :: { Migration , Runner , SchemaVersion } ; ",
+            "use refinery :: { Migration , Runner , SchemaVersion , SqlStringExt } ; ",
             "pub fn runner () -> Runner { ",
             "let quoted_migrations : Vec < (& str , String) > = vec ! [\"V1__first\" , \"valid_sql_file\"] ; ",
             "let mut migrations : Vec < Migration > = Vec :: new () ; ",

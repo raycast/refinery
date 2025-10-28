@@ -36,5 +36,5 @@ pub use refinery_core::{
     error, load_sql_migrations, Error, Migration, Report, Runner, SchemaVersion, Target,
 };
 #[doc(hidden)]
-pub use refinery_core::{AsyncMigrate, Migrate};
+pub use refinery_core::{AsyncMigrate, LineEndingNormalization, Migrate, SqlStringExt};
 pub use refinery_macros::embed_migrations;
